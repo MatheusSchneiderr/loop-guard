@@ -1,0 +1,24 @@
+[package]
+name = "loop-guard"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "loop-guard"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+futures = "0.3"
+bytes = "1"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
