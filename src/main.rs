@@ -265,7 +265,7 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
 
 async fn run_streaming_request(
     state: AppState,
-    original_body: Value,
+    mut original_body: Value,
     messages: Value,
     request_id: String,
     tx: mpsc::Sender<String>,
@@ -281,6 +281,13 @@ async fn run_streaming_request(
     let mut meta_model = String::new();
     let mut meta_created: i64 = 0;
     let mut meta_seen = false;
+
+    let conv_key = conversation_key(&original_body);
+    let cached_slot = { *state.conversation_slots.lock().await.get(&conv_key).unwrap_or(&-1) };
+    let have_cached_slot = cached_slot >= 0;
+    if have_cached_slot {
+        original_body["id_slot"] = json!(cached_slot);
+    }
 
     let upstream_res = match state
         .client
@@ -298,11 +305,42 @@ async fn run_streaming_request(
         }
     };
 
+    if !have_cached_slot {
+        let client = state.client.clone();
+        let upstream_base = state.upstream_base.clone();
+        let slots_map = state.conversation_slots.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(slot_id) = current_processing_slot(&client, &upstream_base).await {
+                slots_map.lock().await.insert(conv_key, slot_id);
+            }
+        });
+    }
+
     let mut byte_stream = upstream_res.bytes_stream();
     let mut triggered_reason: Option<String> = None;
     let mut saw_own_done = false;
 
-    'outer: while let Some(chunk) = byte_stream.next().await {
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(10));
+    keepalive.tick().await;
+
+    'outer: loop {
+        let chunk = tokio::select! {
+            biased;
+            chunk = byte_stream.next() => chunk,
+            _ = keepalive.tick() => {
+                // A raw SSE comment line is invisible to any OpenAI-client
+                // SSE parser but still counts as bytes-on-the-wire, so it
+                // keeps clients with their own stream-idle watchdogs (same
+                // issue as the /v1/messages path - see its comment) from
+                // seeing true silence during a long cold prefill.
+                if tx.send(": keep-alive\n\n".to_string()).await.is_err() {
+                    return;
+                }
+                continue 'outer;
+            }
+        };
+        let Some(chunk) = chunk else { break };
         let Ok(chunk) = chunk else { break };
         let chunk_str = String::from_utf8_lossy(&chunk).to_string();
         if chunk_str.contains("data: [DONE]") {
