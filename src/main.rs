@@ -31,6 +31,7 @@
 //! network-facing, AI-authored, and sits in the hot path of a daily-driver
 //! coding assistant.
 
+mod anthropic;
 mod tracker;
 
 use axum::{
@@ -60,6 +61,7 @@ struct AppState {
     verbose: bool,
     client: reqwest::Client,
     request_counter: Arc<AtomicU64>,
+    model_name: String,
 }
 
 fn now_stamp() -> String {
@@ -411,6 +413,252 @@ async fn run_streaming_request(
     let _ = tx.send("data: [DONE]\n\n".to_string()).await;
 }
 
+// --- Anthropic Messages API front (for Claude Code) ---
+//
+// Claude Code only speaks the Anthropic Messages API, not the
+// OpenAI-compatible format the `/v1/chat/completions` route above (and
+// opencode) use. These two handlers translate a Messages API request into
+// the same OpenAI-shaped request the rest of this file already knows how
+// to drive (including the loop-detection/budget-forcing intervention),
+// then translate the response back. See anthropic.rs for the actual
+// field-by-field translation.
+
+async fn messages_count_tokens(Json(body): Json<Value>) -> Json<Value> {
+    Json(json!({ "input_tokens": anthropic::estimate_input_tokens(&body) }))
+}
+
+async fn messages(State(state): State<AppState>, body: Bytes) -> Response {
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"type": "invalid_request_error", "message": "loop-guard: invalid JSON body"}})),
+            )
+                .into_response();
+        }
+    };
+
+    let openai_body = anthropic::anthropic_to_openai_request(&parsed, &state.model_name);
+    let wants_stream = openai_body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+
+    if !wants_stream {
+        let res = state
+            .client
+            .post(format!("{}/v1/chat/completions", state.upstream_base))
+            .json(&openai_body)
+            .send()
+            .await;
+        return match res {
+            Ok(r) => {
+                let status = r.status();
+                match r.json::<Value>().await {
+                    Ok(openai_resp) if status.is_success() => {
+                        let anthropic_resp = anthropic::openai_response_to_anthropic(&openai_resp, &state.model_name);
+                        (StatusCode::OK, Json(anthropic_resp)).into_response()
+                    }
+                    _ => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"type": "api_error", "message": "loop-guard: upstream error"}})),
+                    )
+                        .into_response(),
+                }
+            }
+            Err(_) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"type": "api_error", "message": "loop-guard: upstream unreachable"}})),
+            )
+                .into_response(),
+        };
+    }
+
+    let (tx, rx) = mpsc::channel::<String>(64);
+    let request_id = format!("req-{}", state.request_counter.fetch_add(1, Ordering::Relaxed));
+    let messages = openai_body.get("messages").cloned().unwrap_or(json!([]));
+
+    tokio::spawn(run_messages_stream(state, openai_body, messages, request_id, tx));
+
+    let stream = ReceiverStream::new(rx).map(|s| Ok::<_, std::io::Error>(Bytes::from(s)));
+    let mut res = Response::new(Body::from_stream(stream));
+    res.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    res
+}
+
+async fn run_messages_stream(
+    state: AppState,
+    original_body: Value,
+    request_messages: Value,
+    request_id: String,
+    tx: mpsc::Sender<String>,
+) {
+    if state.verbose {
+        eprintln!("[{}] loop-guard: {} (anthropic) started", now_stamp(), request_id);
+    }
+
+    let message_id = format!("msg-{}", request_id);
+    let mut anthropic_state = anthropic::AnthropicStreamState::new(message_id, state.model_name.clone());
+    let _ = tx.send(anthropic_state.message_start_event()).await;
+
+    let mut tracker = StepTracker::new(state.threshold, state.min_step_words, request_id.clone());
+    let mut carry = String::new();
+    let mut full_text = String::new();
+
+    let upstream_res = match state
+        .client
+        .post(format!("{}/v1/chat/completions", state.upstream_base))
+        .json(&original_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            for ev in anthropic_state.finish(Some("stop")) {
+                let _ = tx.send(ev).await;
+            }
+            return;
+        }
+    };
+
+    let mut byte_stream = upstream_res.bytes_stream();
+    let mut triggered_reason: Option<String> = None;
+    let mut finish_reason: Option<String> = None;
+
+    'outer: while let Some(chunk) = byte_stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let chunk_str = String::from_utf8_lossy(&chunk).to_string();
+        let payloads = extract_sse_payloads(&chunk_str, &mut carry);
+
+        for p in &payloads {
+            let Ok(parsed): Result<Value, _> = serde_json::from_str(p) else { continue };
+            let delta = &parsed["choices"][0]["delta"];
+
+            let piece = delta
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .or_else(|| delta.get("content").and_then(Value::as_str))
+                .unwrap_or("");
+            if !piece.is_empty() {
+                full_text.push_str(piece);
+                for (event, hit) in tracker.feed(piece) {
+                    if state.verbose {
+                        eprintln!(
+                            "[{}] loop-guard: {} step {} best-match={:?} similarity={:.6}",
+                            now_stamp(),
+                            request_id,
+                            event.step_idx,
+                            event.best_match_idx,
+                            event.similarity
+                        );
+                    }
+                    if let Some(h) = hit {
+                        triggered_reason = Some(h.reason);
+                        break;
+                    }
+                }
+            }
+            if triggered_reason.is_some() {
+                break 'outer;
+            }
+
+            if let Some(fr) = parsed["choices"][0].get("finish_reason").and_then(Value::as_str) {
+                finish_reason = Some(fr.to_string());
+            }
+
+            for ev in anthropic_state.feed_delta(delta) {
+                if tx.send(ev).await.is_err() {
+                    return; // client disconnected
+                }
+            }
+        }
+    }
+
+    let Some(reason) = triggered_reason else {
+        for ev in anthropic_state.finish(finish_reason.as_deref()) {
+            let _ = tx.send(ev).await;
+        }
+        return;
+    };
+
+    eprintln!("[{}] loop-guard: TRIGGERED (anthropic) - {}", now_stamp(), reason);
+
+    // --- Budget-forcing intervention, same technique as the OpenAI path ---
+    let slot_id = current_processing_slot(&state.client, &state.upstream_base).await;
+
+    let Some(base_prompt) = apply_template(&state.client, &state.upstream_base, &request_messages).await else {
+        for ev in anthropic_state.finish(Some("stop")) {
+            let _ = tx.send(ev).await;
+        }
+        return;
+    };
+
+    let continuation_prompt = format!("{base_prompt}{full_text}{LOOP_NUDGE_PREFIX}</think>\n\n");
+
+    for ev in anthropic_state.feed_delta(&json!({"reasoning_content": format!("{LOOP_NUDGE_PREFIX}</think>\n\n")})) {
+        let _ = tx.send(ev).await;
+    }
+
+    let mut completion_req = json!({
+        "prompt": continuation_prompt,
+        "stream": true,
+        "n_predict": original_body.get("max_tokens").and_then(Value::as_i64).unwrap_or(4096),
+    });
+    if let Some(id) = slot_id {
+        completion_req["id_slot"] = json!(id);
+    }
+    for key in ["temperature", "top_p", "top_k", "min_p", "presence_penalty"] {
+        if let Some(v) = original_body.get(key) {
+            completion_req[key] = v.clone();
+        }
+    }
+
+    let completion_res = match state
+        .client
+        .post(format!("{}/completion", state.upstream_base))
+        .json(&completion_req)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            for ev in anthropic_state.finish(Some("stop")) {
+                let _ = tx.send(ev).await;
+            }
+            return;
+        }
+    };
+
+    let mut carry2 = String::new();
+    let mut stream2 = completion_res.bytes_stream();
+    let mut stopped = false;
+    while let Some(chunk) = stream2.next().await {
+        let Ok(chunk) = chunk else { break };
+        let chunk_str = String::from_utf8_lossy(&chunk).to_string();
+        let payloads = extract_sse_payloads(&chunk_str, &mut carry2);
+        for p in payloads {
+            let Ok(parsed): Result<Value, _> = serde_json::from_str(&p) else { continue };
+            if let Some(content) = parsed.get("content").and_then(Value::as_str) {
+                if !content.is_empty() {
+                    for ev in anthropic_state.feed_delta(&json!({"content": content})) {
+                        if tx.send(ev).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            if parsed.get("stop").and_then(Value::as_bool) == Some(true) {
+                stopped = true;
+            }
+        }
+    }
+    let _ = stopped; // budget-forced continuations always end in a natural stop
+    for ev in anthropic_state.finish(Some("stop")) {
+        let _ = tx.send(ev).await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let listen_host = env_or("LOOP_GUARD_HOST", "127.0.0.1");
@@ -420,6 +668,7 @@ async fn main() {
     let threshold = env_or_f64("LOOP_GUARD_THRESHOLD", 0.35);
     let min_step_words = env_or_usize("LOOP_GUARD_MIN_STEP_WORDS", 15);
     let verbose = env_or("LOOP_GUARD_VERBOSE", "0") == "1";
+    let model_name = env_or("LOOP_GUARD_MODEL_NAME", "qwen3.6-35b-a3b-gpu");
 
     let state = AppState {
         upstream_base: format!("http://{upstream_host}:{upstream_port}"),
@@ -431,11 +680,14 @@ async fn main() {
             .build()
             .expect("failed to build HTTP client"),
         request_counter: Arc::new(AtomicU64::new(0)),
+        model_name,
     };
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(messages_count_tokens))
         .with_state(state);
 
     let addr = format!("{listen_host}:{listen_port}");
