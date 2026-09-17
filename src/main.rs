@@ -62,6 +62,38 @@ struct AppState {
     client: reqwest::Client,
     request_counter: Arc<AtomicU64>,
     model_name: String,
+    // Maps a conversation (identified by its stable system+first-user-turn
+    // content, which doesn't change as a Claude Code session grows) to the
+    // llama-server slot that handled its first turn. Every /v1/messages
+    // request resends the *entire* growing history from scratch (the
+    // Messages API is stateless) - pinning follow-up turns to the same
+    // slot lets llama-server's own KV-cache prefix matching skip
+    // reprocessing everything already seen, instead of only the new
+    // suffix, cutting most post-first-turn latency down drastically.
+    conversation_slots: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, i64>>>,
+}
+
+/// Identifies "the same conversation" across independent, stateless HTTP
+/// requests by hashing the system prompt and first user message - both
+/// stable for the life of a Claude Code session, unlike the full messages
+/// array (which grows every turn, so `messages[..-1]` from turn N doesn't
+/// equal `messages` from turn N-1).
+fn conversation_key(openai_body: &Value) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let messages = openai_body.get("messages").and_then(Value::as_array);
+    let text_for_role = |role: &str| -> &str {
+        messages
+            .and_then(|m| m.iter().find(|msg| msg.get("role").and_then(Value::as_str) == Some(role)))
+            .and_then(|msg| msg.get("content").and_then(Value::as_str))
+            .unwrap_or("")
+    };
+
+    let mut hasher = DefaultHasher::new();
+    text_for_role("system").hash(&mut hasher);
+    text_for_role("user").hash(&mut hasher);
+    hasher.finish()
 }
 
 fn now_stamp() -> String {
@@ -489,7 +521,7 @@ async fn messages(State(state): State<AppState>, body: Bytes) -> Response {
 
 async fn run_messages_stream(
     state: AppState,
-    original_body: Value,
+    mut original_body: Value,
     request_messages: Value,
     request_id: String,
     tx: mpsc::Sender<String>,
@@ -506,6 +538,17 @@ async fn run_messages_stream(
     let mut carry = String::new();
     let mut full_text = String::new();
 
+    // Pin this conversation to whichever slot handled its first turn, so
+    // llama-server's KV cache for the (huge, repeatedly-resent) history up
+    // to this point is reused instead of reprocessed. See AppState's
+    // conversation_slots doc comment.
+    let conv_key = conversation_key(&original_body);
+    let cached_slot = { *state.conversation_slots.lock().await.get(&conv_key).unwrap_or(&-1) };
+    let have_cached_slot = cached_slot >= 0;
+    if have_cached_slot {
+        original_body["id_slot"] = json!(cached_slot);
+    }
+
     let upstream_res = match state
         .client
         .post(format!("{}/v1/chat/completions", state.upstream_base))
@@ -521,6 +564,21 @@ async fn run_messages_stream(
             return;
         }
     };
+
+    if !have_cached_slot {
+        // First turn of this conversation: llama-server auto-picked
+        // whichever slot it liked (LRU/prefix-match) - find out which, so
+        // every later turn can be pinned there deliberately.
+        let client = state.client.clone();
+        let upstream_base = state.upstream_base.clone();
+        let slots_map = state.conversation_slots.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(slot_id) = current_processing_slot(&client, &upstream_base).await {
+                slots_map.lock().await.insert(conv_key, slot_id);
+            }
+        });
+    }
 
     let mut byte_stream = upstream_res.bytes_stream();
     let mut triggered_reason: Option<String> = None;
@@ -708,6 +766,7 @@ async fn main() {
             .expect("failed to build HTTP client"),
         request_counter: Arc::new(AtomicU64::new(0)),
         model_name,
+        conversation_slots: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = Router::new()
