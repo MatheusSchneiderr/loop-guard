@@ -526,7 +526,34 @@ async fn run_messages_stream(
     let mut triggered_reason: Option<String> = None;
     let mut finish_reason: Option<String> = None;
 
-    'outer: while let Some(chunk) = byte_stream.next().await {
+    // llama-server sends nothing at all while prefilling a long prompt
+    // (Claude Code's system prompt + full tool schemas routinely run
+    // 10-40k tokens, which can take minutes to prefill on this quantized
+    // model). Claude Code's own stream watchdogs treat total silence on
+    // the wire as a dead connection and abort+retry - which, since a retry
+    // resends the same huge prompt to a *different*, now-busy GPU slot
+    // instead of reusing the one already mid-prefill, only compounds the
+    // problem (confirmed live: a retry left two duplicate prefills
+    // competing for the same 4 GPU slots, each slower than either alone).
+    // An SSE comment line (leading ':') is invisible to any SSE/Anthropic
+    // parser but still counts as bytes-on-the-wire, keeping every one of
+    // Claude Code's watchdogs (byte-level, event-level, body-idle) from
+    // ever seeing true silence.
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(10));
+    keepalive.tick().await; // first tick fires immediately - consume it
+
+    'outer: loop {
+        let chunk = tokio::select! {
+            biased;
+            chunk = byte_stream.next() => chunk,
+            _ = keepalive.tick() => {
+                if tx.send(": keep-alive\n\n".to_string()).await.is_err() {
+                    return; // client disconnected
+                }
+                continue 'outer;
+            }
+        };
+        let Some(chunk) = chunk else { break };
         let Ok(chunk) = chunk else { break };
         let chunk_str = String::from_utf8_lossy(&chunk).to_string();
         let payloads = extract_sse_payloads(&chunk_str, &mut carry);
